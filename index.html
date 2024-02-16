@@ -1,25 +1,647 @@
-<!DOCTYPE html>
-<html>
-	<head>
-		<template-style>
-			<style>
-				.black {
-					background: #FFFFFF;
-				}
-			</style>
-		</template-style>
-			<style>
-				.black {
-					background: #FFFFFF;
-				}
-			</style>
-	</head>
-	<body>
-		<header></header>
-		<main>
-			<div class="black">aaa</div>
-			<div>222</div>
-		</main>
-		<footer></footer>
-	</body>
-</html>
+ScalaRAID: Optimizing Linux Software RAID System for Next-Generation Storage 
+
+
+
+ 
+
+
+
+ABSTRACT
+
+
+
+ RAID has been widely adopted to enhance the performance, capacity, and reliability of the existing storage systems.
+
+However, we observe that the Linux software RAID mdraid suffers from its poor implementation of the lock mechanism.
+
+To address this, we propose ScalaRAID, which refines the role domain of locks and designs a new data structure to prevent different threads from preempting the RAID resources.
+
+By doing so, ScalaRAID can maximize the thread-level parallelism and reduce the time consumption of I/O request handling.
+
+Our evaluation results reveal that ScalaRAID can improve throughput by 89.4% while decreasing 99.99𝑡ℎ percentile latency by 85.4% compared to mdraid.
+
+
+
+
+
+CCS CONCEPTS
+
+
+
+ • Information systems → RAID; • Software and its engineering → Secondary storage.
+
+
+
+
+
+KEYWORDS
+
+
+
+ Solid State Drive, RAID, Operating System, Lock 
+
+
+
+1 INTRODUCTION
+
+
+
+ Over the past years, solid state drives SSDs have become the dominant storage media, which are widely adopted in diverse computing domains including datacenters , high-performance computers , and portable devices .
+
+While SSDs exhibit their superiority over the traditional storage media in terms of throughput, latency, and power efficiency, they, unfortunately, suffer from the low reliability imposed by the NAND flash intrinsics and the limited storage capacity.
+
+Redundant Array of Inexpensive Disks RAID technology is a cost-efficient approach to address the aforementioned challenges.
+
+Specifically, RAID can mitigate the penalty of flash errors by introducing data redundancy.
+
+To extend the capacity of SSD storage in scale, RAID also groups multiple SSD devices as an array, which can deliver a uniform large storage space.
+
+However, as the SSD technology has experienced significant technology shifts, the RAID technology is becoming the performance bottleneck of the future storage system that employs the next-generation SSDs.
+
+To be precise, the emerging PCIe 4.0 SSDs can increase their I/O bandwidth capability up to 7 GB/s .
+
+In contrast, most hardware RAID engines are designed for low-speed storage interface i.e., SATA, whose maximum throughput is limited to 500 MB/s .
+
+Linux software RAID, referred to as mdraid , can break the performance bound by employing multiple CPU threads to prepare the parity data simultaneously.
+
+However, this approach can impose significant software overheads, which in turn introduces huge burden to the CPU.
+
+Consequently, the performance of mdraid, unfortunately, cannot scale as the number of CPU threads and SSD devices increase.
+
+Specifically, we set up an experiment to analyze the execution time breakdown of the storage software stack.
+
+Our evaluation results reveal that the overheads of the lock mechanism account for 30.8% of the total software delays cf.
+
+Sectio 2.2 for more details.
+
+One may consider to remove the lock mechanism from the mdraid.
+
+However, the locks play a critical role in guaranteeing crash consistency and taking charge of data management.
+
+Tackling the aforementioned challenges, we propose ScalaRAID, a Scalable RAID system to aggregate the performance and capacity of the next-generation storage devices with low CPU cost 1 .
+
+Specifically, we employ multiple finegrained locks rather than the traditional coarse-grained lock to protect the critical resources in mdraid, which can minimize the lock preemption.
+
+We also redesign the key data structures in RAID to mitigate the overheads imposed by the existing crash consistency mechanism.
+
+Furthermore, we scatter the entire address space in RAID thereby preventing the collision in metadata updates.
+
+With these proposed designs, ScalaRAID can maximize thread-level parallelism and reduce CPU suspension time caused by lock contention.
+
+Compared to the mdraid design in the Linux system, ScalaRAID improves the overall storage throughput by 89.4% and decreases the 99.99𝑡ℎ percentile I/O latency by 85.4%.
+
+The main contributions of this work can be summarized as follows: • Deep analysis of mdraid: We observe that a mdraid system that consists of multiple high-performance SSDs can only achieve similar performance as a single SSD.
+
+This is because mdraid cannot fully utilize the striping mechanism to improve the storage bandwidth.
+
+We then dig deeply into the CPU utilization and the software overheads.
+
+Our evaluation results reveal that the lock mechanism consumes up to 78× more CPU power than the parity computation.
+
+In other words, the root cause of the performance degradation becomes the lock mechanism rather than RAID’s parity computation.
+
+This is because mdraid usually employs multiple CPU threads to accelerate the request processing.
+
+However, the CPU threads are serialized in front of the locks.
+
+To the best of our knowledge, this is the first study of lock issues in mdraid when one uses it with next-generation SSDs.
+
+• Fine-grained lock mechanism: mdraid employs coarsegrained locks to manage the storage resources and guarantee crash consistency.
+
+The lock contention is not a serious issue when running a few CPU threads to serve software RAID services.
+
+However, the next-generation storage requires more CPU threads to process I/O requests simultaneously thereby maximizing the I/O bandwidth.
+
+This in turn imposes great burden to the existing lock mechanism.
+
+To address this, we propose a parallelism-aware lock mechanism.
+
+In particular, we refine the scope of lock management and increase the number of locks with minor overheads.
+
+We further split the storage resources into multiple segments and assign a finegrained lock to each segment.
+
+This allows different threads to access the segments in parallel.
+
+Our lock mechanism improves the throughput by 39.9%, compared to mdraid.
+
+• Customized data structure to avoid collisions: While our proposed lock mechanism allows parallel accesses to different segments, CPU threads can still be blocked from accessing the same segment owing to ill-designed data structure.
+
+To address this, we redesign the data structure in mdraid to reap the benefits from thread-level parallelism.
+
+Specifically, we customize different types of lock structures to manage data and metadata by carefully considering their own characteristics.
+
+We further scatter each segment across the entire address range in the storage such that CPU threads can be interleaved to access different segments.
+
+These designs further improve the performance by 34.8%, on average, compared to the existing software RAID system.
+
+
+
+
+
+2 BACKGROUND AND MOTIVATION
+
+
+
+ 
+
+
+
+2.1 RAID and Its Implementations
+
+
+
+ Array basics.
+
+Redundant Array of Inexpensive Disks RAID is a storage technology that combines many disks into one logical unit to satisfy the requirements of capacity, performance and reliability .
+
+Figure 1 shows a RAID 5 system with three member disks.
+
+Chunks are the basic data units to manage all the member disks, whose sizes are typically 64 KB.
+
+Chunks of the same offset in different member disks are grouped as stripe chunk S-Chuk.
+
+For a RAID 5 system of N disks, each S-Chunk has N-1 data chunks and 1 parity chunk.
+
+The data in the parity chunk is calculated by XORing the remaining N-1 data chunks.
+
+When one member disk fails, the missing chunk located in the failed member disk can be recovered by XORing the remaining chunks in the S-Chunk.
+
+Therefore, RAID 5 can deliver reliability guarantee.
+
+Note that this paper mainly focuses on RAID 5.
+
+Our designs can also be applied to other RAID levels e.g., RAID 6 and schemes if they suffer from the same lock mechanism and ill-designed data structures as what RAID 5 in mdraid has.
+
+For simplicity, we use the terms “RAID” and “RAID 5” interchangeably.
+
+Software RAID in Linux kernel.
+
+mdraid manages the underlying block devices e.g., SSDs meanwhile providing the I/O services to the upper-level filesystem.
+
+Figure 2 shows the write path of RAID 5 in the mdraid layer .
+
+The minimum data unit for RAID operations is stripe unit S-Uit, whose typical size is 4 KB.
+
+S-Units of the same address offset in all member disks are grouped as stripe head S-Head, cf.
+
+Figure 1, which are managed by Stripe data structure in mdraid cf.
+
+Figure 2.
+
+Stripe records the states of S-Head e.g., read waitig ad computatio completed and acts as the cache of S-Head.
+
+The write procedure in mdraid can be described as follows.
+
+When a write request arrives in mdraid, it will firstly be sliced into S-Units  1 .
+
+Next, to prepare for data processing, S-Units of the same offset then request for a Stripe via get_active_stripe function  2 .
+
+If the number of S-Units in a Stripe does not equal to the length of an S-Head, a read request will be sent to the underlying block device for the missing S-Unit  3a .
+
+Afterwards, the CPU threads calculate the parity codes  3b .
+
+Once the calculation completes, the S-Head will be sent to the storage device  4a  and finally the Stripe will be recycled  4b .
+
+To prevent multiple threads from competing for the same Stripe, Linux uses few global locks to guarantee the exclusive allocation of the Stripes.
+
+Crash consistency.
+
+In addition to the locks for Stripe allocation, mdraid requires extra locks to enable crash consistency.
+
+Specifically, when a power failure occurs in the process of chunk write, the chunk being written to the storage becomes an uncertain value.
+
+During system reboot, mdraid is unable to locate and fix the write faults, which shatters the fault tolerance of RAID.
+
+This phenomenon is referred to as write hole .
+
+To address this issue, mdraid employs a bitmap mechanism to guarantee the crash consistency.
+
+In detail, a group of S-Heads are clustered as stripe block S-Block, cf.
+
+Figure 1.
+
+An S-Block typically covers address range of 64 MB on each disk.
+
+mdraid maintains a table of counters, each mapping to a specific S-Block.
+
+The counter records the number of S-Heads in an S-Block that are being written.
+
+This table will be flushed back to the member disks in batches by a daemon process and stored as a bitmap.
+
+During the recovery procedure, we can scan the bitmap to figure out which S-Block should be recalculated to synchronize data and parity.
+
+mdraid employs a single global lock to avoid the competition in counter updates.
+
+
+
+
+
+2.2 Motivation
+
+
+
+ To better understand the impacts of mdraid on the system performance, we perform an experiment on the real PCIe 4.0 SSD arrays cf.
+
+Sectio 4.1 for experimet details.
+
+Figure 3a shows the write throughput of RAID that consists of three SSDs.
+
+We vary the CPU threads from 3 to 33.
+
+The write bandwidth of RAID increases as we put more CPU threads for computation.
+
+However, it cannot exceed the bandwidth of a single SSD.
+
+Figure 3b shows the peak performance of RAID that employs different numbers of member SSDs.
+
+Increasing the number of member SSDs can slightly improve the overall throughput.
+
+For example, mdraid of 7 member SSDs only exceeds the performance of a single SSD by 63.5%.
+
+This indicates that mdraid cannot fully reap the benefits from the striping mechanism.
+
+We further analyze the CPU cost of mdraid with different numbers of threads and member SSDs, which is shown in Figure 3c and 3d.
+
+We categorize the cost into Counter lock, Stripe lock, Submit bio, Mem copy and XOR.
+
+Counter lock and Stripe lock represent for the time consumed by the lock procedure of counters and Stripes, respectively.
+
+Mem copy and Submit bio are the time of bio preparation and submission to drivers.
+
+Lastly, XOR is the time of parity computation.
+
+The overheads of the lock mechanisms icludig Couter lock ad Stripe lock only account for 3.5% of the total I/O access time when employing 3 CPU threads.
+
+Nevertheless, the overheads reach 30.8% when using 33 threads, which is 78 times more than XOR.
+
+In this work, we primarily focus on mitigating the write penalty imposed by the lock mechanism.
+
+Note that the lock mechanism imposes near-zero overheads for read I/O requests as read request handling is slightly different from the write one.
+
+This is because, in most cases, read requests can be easily handled by chunk_aligned_read function without using the aforementioned locks.
+
+
+
+
+
+3 SCALARAID DESIGN
+
+
+
+ To mitigate the aforementioned overheads, ScalaRAID manages the Stripes and the counter table with multiple finegrained locks §3.1.
+
+ScalaRAID further prevents multiple CPU threads from contending for the same data by employing a new data structure to shuffle these accesses §3.2.
+
+
+
+
+
+3.1 Multiple Locks, Not One
+
+
+
+ Owing to the constraints of DRAM capacity, the number of Stripes in mdraid is usually limited e.g., 256.
+
+Therefore, mdraid introduces a lock mechanism to prevent multiple CPU threads from preempting the Stripe allocation.
+
+However, the rudimentary lock mechanism in mdraid leads to a large number of CPU threads blocked in the process of requesting Stripes.
+
+This introduces the penalty of Stripe lock.
+
+Figure 4a shows our solution to resolve the lock issues.
+
+Our key insight is that we can employ multiple locks to manage different Stripes separately.
+
+Specifically, we increase the number of Stripe locks and interleave CPU threads to access different Stripe locks by leveraging a hash algorithm.
+
+This hash algorithm takes targeted page number 𝑝 as input and outputs 𝑝&𝑠 − 1, where 𝑠 and "&" are the number of Stripe locks and the bit-wise AND operation, respectively.
+
+Our design allows different threads cf.
+
+T1 ad T2 i Figure 4a to run in parallel and improves the overall RAID throughput while reducing request completion time in an I/O write burst by omitting the collision penalty.
+
+Unfortunately, simply increasing the number of Stripe locks cannot thoroughly resolve the lock issues.
+
+Specifically, once a Stripe has been successfully acquired, the CPU thread continues to update the values in the counter table.
+
+As mdraid employs only a single spin lock to manage all the accesses to the counter table, all the CPU threads should be serialized in front of the counter table.
+
+As shown in Figure 4b, when both CPU threads T1 and T2 need to modify the counter table, they compete for the spin lock.
+
+T2 has to wait until T1 finishes its access 1a ad 1b and releases the lock.
+
+To break the bound of serialization, we propose a multi-lock counter table.
+
+Our key insight is that different CPU threads may access different counters separately.
+
+Thus, our ScalaRAID splits the counter table into multiple segments and assigns a dedicated lock to each segment.
+
+The counters in the counter table, which map to neighboring S-Blocks, are interleaved across different segments.
+
+Thus, CPU threads that target different segments can acquire the locks simultaneously, thereby improving the thread-level parallelism.
+
+Figure 4b shows an example of our design i.e., red arrows.
+
+CPU threads T1 and T2 can acquire different counter locks and update the counters in parallel.
+
+It is worth noting that the counter lock is also used to protect the metadata update of the counter table.
+
+For example, when we need to shrink the storage space of a RAID system, the corresponding entries within the counter table should be deleted cf.
+
+T3 i Figure 4b.
+
+However, modifying both the counter values and their metadata simultaneously can result in memory faults.
+
+We observe that mdraid rarely updates the metadata of the counter table.
+
+Thus, we employ a readerswriter lock mechanism to protect the metadata, which can reap the most benefits from this condition.
+
+Specifically, the reader locks can be owned by multiple CPU threads while the writer lock is exclusively held by a single thread.
+
+Before updating the metadata, the CPU thread acquires the writer lock cf.
+
+3a i Figure 4b.
+
+Otherwise, if the CPU threads need to revise the counter values, they apply for the reader locks and the counter locks successively.
+
+Note that our work concentrates on mitigating the lock overheads e.g., couter locks used by the bitmap mechaism.
+
+Our design of the finegrained locks does not affect the correctness of the existing crash consistency mechanism.
+
+
+
+
+
+3.2 Distributed Blocks, Not Centralized
+
+
+
+ In MD, S-Block by default covers an address range of 64 MB.
+
+In other word, a counter needs to record and manage such a wide range of address space.
+
+This design is optimized for large-size write requests but may harm small-size write requests.
+
+Figure 4c shows an example.
+
+Let’s suppose that T1 and T2 need to modify different S-Heads A and B in the same S-Block.
+
+They then contend for modifying the same counter, which results in hanging up T2.
+
+Note that our multilock counter table allows multiple threads to access different counters simultaneously.
+
+It cannot prevent the congestion that targets the same counter.
+
+One possible solution is to reduce the cover range of SBlocks thereby reducing the chances of access collisions.
+
+For example, we can adjust an S-Block to cover only a single S-Head 4KB.
+
+However, as a trade-off, such design can introduce huge memory consumption in the kernel.
+
+Specifically, mdraid needs to allocate a 2-byte memory space for each counter.
+
+RAID of multiple 2TB SSDs requires 1 GB memory space to accommodate the counter table, which imposes huge overheads to the system.
+
+An alternative solution is to place the counter table in the SSDs.
+
+mdraid can allocate memory space to buffer the counter table via mmap .
+
+However, this in turn introduces the overheads of page faults .
+
+Considering that random writes usually modify different counters frequently, frequent page faults can significantly increase the tail latency of write completion.
+
+To tackle the challenges imposed by the traditional S-Block design, we propose a new data structure, called Distributed Block D-Block, which is shown in Figure 4c.
+
+D-Block consists of multiple S-Heads.
+
+In contrast to S-Block, the S-Heads in D-Block are spread across different locations in the SSDs via a configurable hash function rather than mapping to a continuous SSD space.
+
+The default hash function takes the offset of S-Head as input and outputs ⌈log𝑆𝑖𝑧𝑒/𝐷𝑠𝑖𝑧𝑒⌉ rightmost bits of the input offset, where 𝑆𝑖𝑧𝑒 and 𝐷𝑠𝑖𝑧𝑒 are the capacity of member disk and cover ranges of D-Block, respectively.
+
+Thus, S-Heads in the same D-Block are dispersed uniformly across the whole space.
+
+While a D-Block maintains a cover range of 64 MB, sequential write requests are shuffled to access different D-Blocks.
+
+By doing so, ScalaRAID can effectively reduce the counter preemption.
+
+
+
+
+
+4 EVALUATION
+
+
+
+ 
+
+
+
+4.1 Experimental Setup
+
+
+
+ Methodology.
+
+We conduct the experiments on a server that consists of a 26-core processor and 128 GB DDR4 memory.
+
+We employ Linux v5.11.0 as the default kernel in this evaluation.
+
+We also use mdadm v4.1 to create RAID from up to seven 1TB Samsung 980Pro SSDs .
+
+In this experiment, we use 2+1 SSDs i.e., 3 SSDs, "+1" is the usual expressio to emphasize the parity as default.
+
+We use FIO v3.16 to evaluate the performance of different RAID systems.
+
+In FIO, We set the iodepth to 32 and employ an asynchronous I/O engine libaio .
+
+Besides, we use Perf v5.11 to record the CPU usage of the OS software stack.
+
+We configure the I/O size as 4 KB in the latency evaluation while the I/O sizes are adjusted to full stripe in bandwidth evaluation cf.
+
+Table 1.
+
+It is worth noting that we employ a single thread as the mdraid daemon cf.
+
+Sectio 2.1.
+
+Additionally, we employ the same number of worker threads as FIO threads to maximize the performance of RAID, which is inspired by .
+
+Worker threads do the same work as daemon e.g., submittig bio to member disk.
+
+All the daemon threads, worker threads, and FIO threads are counted in the following evaluation.
+
+Table 2 lists the important configurations in our experiments.
+
+RAID systems.
+
+We implement three different RAID systems.
+
+1 OrigRAID: adopting the default configurations of mdraid; 2 HemiRAID: based on OrigRAID, we increase the number of Stripe locks to 128; 3 ScalaRAID: based on HemiRAID, we equip every counter with a counter lock cf.
+
+Sectio 3.1 and employ our D-Block cf.
+
+Sectio 3.2.
+
+Considering that the evaluated RAID system consists of several 1TB SSDs, ScalaRAID totally requires 16,384 counter locks.
+
+We summarize the RAID system configurations in Table 2.
+
+
+
+
+
+4.2 Performance Comparison
+
+
+
+ Bandwidth.
+
+Figures 5a and 5b show full stripe sequential write and read bandwidths of the evaluated RAID systems, respectively.
+
+As the number of CPU threads increases, the write bandwidth of OrigRAID gradually increases.
+
+Nevertheless, such bandwidth saturates when the number of CPU threads reaches 9.
+
+HemiRAID outperforms OrigRAID by 30.8% and 39.9% when using 17 and 33 threads, respectively.
+
+This is because HemiRAID allows more threads to get Stripe simultaneously and thus processes multiple requests in parallel.
+
+ScalaRAID can further improve the bandwidth by 34.8%, on average, compared to HemiRAID.
+
+This is because ScalaRAID resolves the counter lock contention thereby maximizing the parallelism of request handling.
+
+On the other hand, ScalaRAID achieves almost the same read performance as OrigRAID and HemiRAID.
+
+This is because ScalaRAID has minor impact on the read path of mdraid cf.
+
+Sectio 2.2.
+
+Latency.
+
+Figures 5c and 5d illustrate the 99.99𝑡ℎ percentile write and read latencies measured from different RAID systems, respectively.
+
+The 99.99𝑡ℎ percentile write latency of OrigRAID and HemiRAID are close to each other.
+
+This is because although HemiRAID reduces the time for threads to request Stripes, these threads are still blocked by the only one counter lock cf.
+
+Sectio 3.1.
+
+ScalaRAID, on the other hand, increases the number of counter locks and employs a new data structure D-Block to mitigate the contention imposed by simultaneous counter updates.
+
+ScalaRAID also prevents the CPU threads from being blocked by the Stripe, which can minimize the software overheads.
+
+Therefore, the 99.99𝑡ℎ percentile latencies of ScalaRAID are reduced to only 44.9%, 14.6%, and 15.9% for RAIDs that consists of 2+1, 4+1, and 6+1 member SSDs, respectively.
+
+In contrast, ScalaRAID, HemiRAID, and OrigRAID have similar 99.99𝑡ℎ percentile read latency.
+
+The subtle performance differences can be considered as an experiment noise.
+
+This performance behavior is similar to our observation in the sequential read throughput.
+
+
+
+
+
+4.3 Scalability and Overhead Analysis
+
+
+
+ Scalability.
+
+We further measure the performance scalability of different RAID systems by increasing the number of member SSDs.
+
+The evaluation results are shown in Figures 6a and 6b.
+
+For full stripe sequential writes, the bandwidth of ScalaRAID exceeds that of OrigRAID to 1.9×, 1.8×, and 1.6×, respectively, in 2+1, 4+1, and 6+1 SSDs.
+
+Compared to OrigRAID, ScalaRAID also improves the performance by 67.2%, on average, for random full stripe writes.
+
+This is because ScalaRAID successfully parallelizes request handling and thus reaps higher bandwidth from more drives.
+
+In other word, ScalaRAID is more suitable for RAID consisting of a large number of SSDs than OrigRAID.
+
+Overheads.
+
+To demonstrate the efficiency of different RAID systems, we measure the throughput under different CPU usages.
+
+The collected statistics are shown in Figure 6c.
+
+Compared to OrigRAID, HemiRAID and ScalaRAID can achieve 25.5% and 74.7% performance improvement under the same CPU usages, respectively.
+
+This indicates that HemiRAID and ScalaRAID can better utilize the CPU threads.
+
+Figure 6d shows usage breakdown of the orange line in 6c.
+
+Compared to OrigRAID, HemiRAID can reduce the Stripe lock overheads by 97.8%.
+
+However, as HemiRAID employs only a simple lock for the counter table, the counter lock becomes the performance bottleneck.
+
+Compared to HemiRAID, ScalaRAID designs new lock mechanisms for both the Stripes and the counter table.
+
+Therefore, ScalaRAID reduces the time cost of Stripe lock and counter lock to 3.2% and 0.5%, respectively.
+
+Nevertheless, there still exist other sophisticated management mechanisms in the storage software stack e.g., the complex state machies to maage Stripes, which impose significant CPU overheads 84.6% i ScalaRAID.
+
+They become the major obstacles in scaling up the performance of ScalaRAID linearly.
+
+It is worth noting that ScalaRAID has minor modification to the existing system software, which exposes few memory cost.
+
+Specifically, as a single lock is 4 B, our proposed Stripe locks take up 512 B memory space.
+
+For ScalaRAID with multiple 1 TB member SSDs, 16,384 counter locks consume 64 KB memory space in total, which is negligible compared to a 128 GB memory system.
+
+
+
+
+
+5 RELATED WORK
+
+
+
+ Crash consistency.
+
+In addition to the bitmap mechanism, there exist multiple approaches to guarantee crash consistency in RAID.
+
+leverages journaling to record the transactions of RAID.
+
+Once an unclean shutdown occurs, replays these transactions to restore the data.
+
+protects crash consistency by employing the Copy-on-Write semantic.
+
+As this design does not modify data in place, can simply restore the parity after failures.
+
+Among the aforementioned solutions, the bitmap mechanism exhibits the best performance in terms of bandwidth and latency.
+
+Therefore, we select the bitmap mechanism as the baseline of ScalaRAID.
+
+RAID optimization.
+
+Multiple prior works focus on mitigating the penalty of updating parity codes in RAID.
+
+Specifically, propose accelerating the parity update by offloading the computation tasks to GPUs.
+
+utilize NVRAM to cache data.
+
+It postpones the parity update until the cached data can be merged into full stripe.
+
+By doing so, it can eliminate the read overheads before parity computation.
+
+In contrast, ScalaRAID addresses the performance issues imposed by the lock mechanism in software RAID.
+
+Our design does not require any hardware modification.
+
+Note that ScalaRAID is orthogonal to the aforementioned approaches.
+
+
+
+
+
+6 CONCLUSION
+
+
+
+ The lock mechanism has become the performance bottleneck of mdraid.
+
+In this work, we propose ScalaRAID, which achieves scalable performance of the storage management software by relaxing the constraints imposed by the lock mechanism.
+
+ScalaRAID successfully aggregates the performance and capacity of the next-generation storage with low CPU cost.
