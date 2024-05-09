@@ -8,21 +8,25 @@
 <body>
     <div id="menu-container"></div>
     <script>
-        // Fetch API를 사용하여 menu.html 불러오기
-        fetch('menu.html')
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error('Network response was not ok');
-                }
-                return response.text();
-            })
-            .then(html => {
-                // 불러온 HTML을 menu-container 요소에 삽입
-                document.getElementById('menu-container').innerHTML = html;
-            })
-            .catch(error => {
-                console.error('Fetch failed:', error);
-            });
+        // XMLHttpRequest 객체 생성
+        var xhr = new XMLHttpRequest();
+
+        // GET 요청 보내기
+        xhr.open('GET', 'menu.html', true);
+
+        // 요청 완료 후 실행할 함수 정의
+        xhr.onload = function() {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                // 요청이 성공했을 때 메뉴를 표시할 요소에 응답을 삽입
+                document.getElementById('menu-container').innerHTML = xhr.responseText;
+            } else {
+                // 요청이 실패했을 때 오류 메시지를 표시
+                console.error('Request failed. Status: ' + xhr.status);
+            }
+        };
+
+        // 요청 보내기
+        xhr.send();
     </script>
 </body>
 </html>
